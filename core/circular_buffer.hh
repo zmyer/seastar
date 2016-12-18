@@ -33,6 +33,7 @@
 // constructors instead of move/copy assignments, which are less efficient).
 
 #include "transfer.hh"
+#include "bitops.hh"
 #include <memory>
 #include <algorithm>
 
@@ -59,7 +60,7 @@ public:
     circular_buffer(const circular_buffer& X) = delete;
     ~circular_buffer();
     circular_buffer& operator=(const circular_buffer&) = delete;
-    circular_buffer& operator=(circular_buffer&&) = delete;
+    circular_buffer& operator=(circular_buffer&& b) noexcept;
     void push_front(const T& data);
     void push_front(T&& data);
     template <typename... A>
@@ -216,7 +217,8 @@ inline
 void
 circular_buffer<T, Alloc>::reserve(size_t size) {
     if (capacity() < size) {
-        expand(size);
+        // Make sure that the new capacity is a power of two.
+        expand(size_t(1) << log2ceil(size));
     }
 }
 
@@ -225,6 +227,16 @@ inline
 circular_buffer<T, Alloc>::circular_buffer(circular_buffer&& x)
     : _impl(std::move(x._impl)) {
     x._impl = {};
+}
+
+template <typename T, typename Alloc>
+inline
+circular_buffer<T, Alloc>& circular_buffer<T, Alloc>::operator=(circular_buffer&& x) noexcept {
+    if (this != &x) {
+        this->~circular_buffer();
+        new (this) circular_buffer(std::move(x));
+    }
+    return *this;
 }
 
 template <typename T, typename Alloc>

@@ -24,6 +24,7 @@
 #include "net.hh"
 #include "ip.hh"
 #include "tcp-stack.hh"
+#include "tcp.hh"
 #include "udp.hh"
 #include "virtio.hh"
 #include "dpdk.hh"
@@ -41,6 +42,8 @@
 #include <unistd.h>
 
 namespace net {
+
+using namespace seastar;
 
 enum class xen_info {
     nonxen = 0,
@@ -145,7 +148,7 @@ private:
 public:
     explicit native_network_stack(boost::program_options::variables_map opts, std::shared_ptr<device> dev);
     virtual server_socket listen(socket_address sa, listen_options opt) override;
-    virtual future<connected_socket> connect(socket_address sa, socket_address local) override;
+    virtual ::seastar::socket socket() override;
     virtual udp_channel make_udp_channel(ipv4_addr addr) override;
     virtual future<> initialize() override;
     static future<std::unique_ptr<network_stack>> create(boost::program_options::variables_map opts) {
@@ -204,36 +207,27 @@ native_network_stack::listen(socket_address sa, listen_options opts) {
     return tcpv4_listen(_inet.get_tcp(), ntohs(sa.as_posix_sockaddr_in().sin_port), opts);
 }
 
-future<connected_socket>
-native_network_stack::connect(socket_address sa, socket_address local) {
-    // FIXME: local is ignored since native stack does not support multiple IPs yet
-    assert(sa.as_posix_sockaddr().sa_family == AF_INET);
-    return tcpv4_connect(_inet.get_tcp(), sa);
+seastar::socket native_network_stack::socket() {
+    return tcpv4_socket(_inet.get_tcp());
 }
 
 using namespace std::chrono_literals;
 
 future<> native_network_stack::run_dhcp(bool is_renew, const dhcp::lease& res) {
-    lw_shared_ptr<dhcp> d = make_lw_shared<dhcp>(_inet);
-
+    dhcp d(_inet);
     // Hijack the ip-stack.
-    for (unsigned i = 0; i < smp::count; i++) {
-        smp::submit_to(i, [d] {
-            auto & ns = static_cast<native_network_stack&>(engine().net());
-            ns.set_ipv4_packet_filter(d->get_ipv4_filter());
-        });
-    }
-
-    net::dhcp::result_type fut = is_renew ? d->renew(res) : d->discover();
-
-    return fut.then([this, d, is_renew](bool success, const dhcp::lease & res) {
-        for (unsigned i = 0; i < smp::count; i++) {
-            smp::submit_to(i, [] {
+    auto f = d.get_ipv4_filter();
+    return smp::invoke_on_all([f] {
+        auto & ns = static_cast<native_network_stack&>(engine().net());
+        ns.set_ipv4_packet_filter(f);
+    }).then([this, d = std::move(d), is_renew, res]() mutable {
+        net::dhcp::result_type fut = is_renew ? d.renew(res) : d.discover();
+        return fut.then([this, is_renew](bool success, const dhcp::lease & res) {
+            return smp::invoke_on_all([] {
                 auto & ns = static_cast<native_network_stack&>(engine().net());
                 ns.set_ipv4_packet_filter(nullptr);
-            });
-        }
-        on_dhcp(success, res, is_renew);
+            }).then(std::bind(&net::native_network_stack::on_dhcp, this, success, res, is_renew));
+        }).finally([d = std::move(d)] {});
     });
 }
 

@@ -27,58 +27,13 @@
 #include <cstring>
 #include "core/future.hh"
 #include "net/byteorder.hh"
+#include "net/socket_defs.hh"
 #include "net/packet.hh"
 #include "core/print.hh"
 #include "core/temporary_buffer.hh"
 #include "core/iostream.hh"
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/ip.h>
-
-struct ipv4_addr;
-
-class socket_address {
-public:
-    union {
-        ::sockaddr_storage sas;
-        ::sockaddr sa;
-        ::sockaddr_in in;
-    } u;
-    socket_address(sockaddr_in sa) {
-        u.in = sa;
-    }
-    socket_address(ipv4_addr);
-    socket_address() = default;
-    ::sockaddr& as_posix_sockaddr() { return u.sa; }
-    ::sockaddr_in& as_posix_sockaddr_in() { return u.in; }
-    const ::sockaddr& as_posix_sockaddr() const { return u.sa; }
-    const ::sockaddr_in& as_posix_sockaddr_in() const { return u.in; }
-};
-
-struct listen_options {
-    bool reuse_address = false;
-    listen_options(bool rua = false)
-        : reuse_address(rua)
-    {}
-};
-
-struct ipv4_addr {
-    uint32_t ip;
-    uint16_t port;
-
-    ipv4_addr() : ip(0), port(0) {}
-    ipv4_addr(uint32_t ip, uint16_t port) : ip(ip), port(port) {}
-    ipv4_addr(uint16_t port) : ip(0), port(port) {}
-    ipv4_addr(const std::string &addr);
-    ipv4_addr(const std::string &addr, uint16_t port);
-
-    ipv4_addr(const socket_address &sa) {
-        ip = net::ntoh(sa.u.in.sin_addr.s_addr);
-        port = net::ntoh(sa.u.in.sin_port);
-    }
-
-    ipv4_addr(socket_address &&sa) : ipv4_addr(sa) {}
-};
+#include <boost/variant.hpp>
 
 static inline
 bool is_ip_unspecified(ipv4_addr &addr) {
@@ -109,6 +64,15 @@ socket_address make_ipv4_address(ipv4_addr addr) {
     return sa;
 }
 
+inline
+socket_address make_ipv4_address(uint32_t ip, uint16_t port) {
+    socket_address sa;
+    sa.u.in.sin_family = AF_INET;
+    sa.u.in.sin_port = htons(port);
+    sa.u.in.sin_addr.s_addr = htonl(ip);
+    return sa;
+}
+
 namespace net {
 
 // see linux tcp(7) for parameter explanation
@@ -118,8 +82,17 @@ struct tcp_keepalive_params {
     unsigned count; // TCP_KEEPCNT
 };
 
+// see linux sctp(7) for parameter explanation
+struct sctp_keepalive_params {
+    std::chrono::seconds interval; // spp_hbinterval
+    unsigned count; // spp_pathmaxrt
+};
+
+using keepalive_params = boost::variant<tcp_keepalive_params, sctp_keepalive_params>;
+
 /// \cond internal
 class connected_socket_impl;
+class socket_impl;
 class server_socket_impl;
 class udp_channel_impl;
 class get_impl;
@@ -210,9 +183,9 @@ public:
     /// \return whether the keepalive option is enabled or not
     bool get_keepalive() const;
     /// Sets TCP keepalive parameters
-    void set_keepalive_parameters(const net::tcp_keepalive_params& p);
+    void set_keepalive_parameters(const net::keepalive_params& p);
     /// Get TCP keepalive parameters
-    net::tcp_keepalive_params get_keepalive_parameters() const;
+    net::keepalive_params get_keepalive_parameters() const;
 
     /// Disables output to the socket.
     ///
@@ -231,6 +204,43 @@ public:
     ///
     /// Equivalent to \ref shutdown_input() and \ref shutdown_output().
 };
+/// @}
+
+/// \addtogroup networking-module
+/// @{
+
+namespace seastar {
+
+/// The seastar socket.
+///
+/// A \c socket that allows a connection to be established between
+/// two endpoints.
+class socket {
+    std::unique_ptr<net::socket_impl> _si;
+public:
+    ~socket();
+
+    /// \cond internal
+    explicit socket(std::unique_ptr<net::socket_impl> si);
+    /// \endcond
+    /// Moves a \c seastar::socket object.
+    socket(socket&&) noexcept;
+    /// Move-assigns a \c seastar::socket object.
+    seastar::socket& operator=(seastar::socket&&) noexcept;
+
+    /// Attempts to establish the connection.
+    ///
+    /// \return a \ref connected_socket representing the connection.
+    future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, {0}}), seastar::transport proto = seastar::transport::TCP);
+    /// Stops any in-flight connection attempt.
+    ///
+    /// Cancels the connection attempt if it's still in progress, and
+    /// terminates the connection if it has already been established.
+    void shutdown();
+};
+
+} /* namespace seastar */
+
 /// @}
 
 /// \addtogroup networking-module
@@ -273,7 +283,10 @@ public:
     virtual ~network_stack() {}
     virtual server_socket listen(socket_address sa, listen_options opts) = 0;
     // FIXME: local parameter assumes ipv4 for now, fix when adding other AF
-    virtual future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, {0}})) = 0;
+    future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, {0}}), seastar::transport proto = seastar::transport::TCP) {
+        return socket().connect(sa, local, proto);
+    }
+    virtual seastar::socket socket() = 0;
     virtual net::udp_channel make_udp_channel(ipv4_addr addr = {}) = 0;
     virtual future<> initialize() {
         return make_ready_future();

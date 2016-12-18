@@ -73,6 +73,58 @@ SEASTAR_TEST_CASE(test_x509_client_with_system_trust) {
     });
 }
 
+SEASTAR_TEST_CASE(test_x509_client_with_builder_system_trust) {
+    tls::credentials_builder b;
+    b.set_system_trust();
+    return connect_to_ssl_google(b.build_certificate_credentials());
+}
+
+SEASTAR_TEST_CASE(test_x509_client_with_builder_system_trust_multiple) {
+    tls::credentials_builder b;
+    b.set_system_trust();
+    auto creds = b.build_certificate_credentials();
+
+    return parallel_for_each(boost::irange(0, 20), [creds](auto i) { return connect_to_ssl_google(creds); });
+}
+
+SEASTAR_TEST_CASE(test_x509_client_with_priority_strings) {
+    static std::vector<sstring> prios( { "NONE:+VERS-TLS-ALL:+MAC-ALL:+RSA:+AES-128-CBC:+SIGN-ALL:+COMP-NULL",
+        "NORMAL:+ARCFOUR-128", // means normal ciphers plus ARCFOUR-128.
+        "SECURE128:-VERS-SSL3.0:+COMP-DEFLATE", // means that only secure ciphers are enabled, SSL3.0 is disabled, and libz compression enabled.
+        "NONE:+VERS-TLS-ALL:+AES-128-CBC:+RSA:+SHA1:+COMP-NULL:+SIGN-RSA-SHA1",
+        "NONE:+VERS-TLS-ALL:+AES-128-CBC:+ECDHE-RSA:+SHA1:+COMP-NULL:+SIGN-RSA-SHA1:+CURVE-SECP256R1",
+        "SECURE256:+SECURE128",
+        "NORMAL:%COMPAT",
+        "NORMAL:-MD5",
+        "NONE:+VERS-TLS-ALL:+MAC-ALL:+RSA:+AES-128-CBC:+SIGN-ALL:+COMP-NULL",
+        "NORMAL:+ARCFOUR-128",
+        "SECURE128:-VERS-TLS1.0:+COMP-DEFLATE",
+        "SECURE128:+SECURE192:-VERS-TLS-ALL:+VERS-TLS1.2"
+    });
+    return do_for_each(prios, [](const sstring & prio) {
+        tls::credentials_builder b;
+        b.set_system_trust();
+        b.set_priority_string(prio);
+        return connect_to_ssl_google(b.build_certificate_credentials());
+    });
+}
+
+SEASTAR_TEST_CASE(test_x509_client_with_priority_strings_fail) {
+    static std::vector<sstring> prios( { "NONE",
+        "NONE:+CURVE-SECP256R1"
+    });
+    return do_for_each(prios, [](const sstring & prio) {
+        tls::credentials_builder b;
+        b.set_system_trust();
+        b.set_priority_string(prio);
+        return connect_to_ssl_google(b.build_certificate_credentials()).then([] {
+            BOOST_FAIL("Expected exception");
+        }).handle_exception([](auto ep) {
+            // ok.
+        });
+    });
+}
+
 struct streams {
     ::connected_socket s;
     input_stream<char> in;
@@ -89,14 +141,17 @@ class echoserver {
     ::shared_ptr<tls::server_credentials> _certs;
     seastar::gate _gate;
     bool _stopped = false;
+    size_t _size;
 public:
-    echoserver()
+    echoserver(size_t message_size)
             : _certs(
                     ::make_shared<tls::server_credentials>(
-                            ::make_shared<tls::dh_params>())) {
-    }
+                            ::make_shared<tls::dh_params>()))
+            , _size(message_size)
+    {}
 
-    future<> listen(socket_address addr, sstring crtfile, sstring keyfile) {
+    future<> listen(socket_address addr, sstring crtfile, sstring keyfile, tls::client_auth ca = tls::client_auth::NONE) {
+        _certs->set_client_auth(ca);
         return _certs->set_x509_key_file(crtfile, keyfile, tls::x509_crt_format::PEM).then([this, addr] {
             ::listen_options opts;
             opts.reuse_address = true;
@@ -106,8 +161,8 @@ public:
             with_gate(_gate, [this] {
                 return _socket.accept().then([this](::connected_socket s, socket_address) {
                     auto strms = ::make_lw_shared<streams>(std::move(s));
-                    return repeat([strms]() {
-                        return strms->in.read_exactly(message.size()).then([strms](temporary_buffer<char> buf) {
+                    return repeat([strms, this]() {
+                        return strms->in.read_exactly(_size).then([strms](temporary_buffer<char> buf) {
                             if (buf.empty()) {
                                 return make_ready_future<stop_iteration>(stop_iteration::yes);
                             }
@@ -125,6 +180,12 @@ public:
                     if (_stopped) {
                         return make_ready_future<>();
                     }
+                    try {
+                        std::rethrow_exception(ep);
+                    } catch (tls::verification_error &) {
+                        // assume ok
+                        return make_ready_future<>();
+                    }
                     return make_exception_future(std::move(ep));
                 });
             });
@@ -139,26 +200,45 @@ public:
     }
 };
 
-static future<> run_echo_test(int loops, sstring trust, sstring name, sstring crt = "tests/test.crt", sstring key = "tests/test.key") {
+static future<> run_echo_test(sstring message,
+                int loops,
+                sstring trust,
+                sstring name,
+                sstring crt = "tests/test.crt",
+                sstring key = "tests/test.key",
+                tls::client_auth ca = tls::client_auth::NONE,
+                sstring client_crt = {},
+                sstring client_key = {}
+)
+{
     static const auto port = 4711;
 
+    auto msg = ::make_shared<sstring>(std::move(message));
     auto certs = ::make_shared<tls::certificate_credentials>();
     auto server = ::make_shared<seastar::sharded<echoserver>>();
     auto addr = ::make_ipv4_address( {0x7f000001, port});
 
-    return certs->set_x509_trust_file(trust, tls::x509_crt_format::PEM).then([=] {
-        return server->start().then([=]() {
-            return server->invoke_on_all(&echoserver::listen, addr, crt, key);
+    future<> f = make_ready_future();
+
+    if (!client_crt.empty() && !client_key.empty()) {
+        f = certs->set_x509_key_file(client_crt, client_key, tls::x509_crt_format::PEM);
+    }
+
+    return f.then([=] {
+        return certs->set_x509_trust_file(trust, tls::x509_crt_format::PEM);
+    }).then([=] {
+        return server->start(msg->size()).then([=]() {
+            return server->invoke_on_all(&echoserver::listen, addr, crt, key, ca);
         }).then([=] {
-            return tls::connect(certs, addr, name).then([loops](::connected_socket s) {
+            return tls::connect(certs, addr, name).then([loops, msg](::connected_socket s) {
                 auto strms = ::make_lw_shared<streams>(std::move(s));
                 auto range = boost::irange(0, loops);
-                return do_for_each(range, [strms](auto) {
-                    return strms->out.write(message).then([strms]() {
-                        return strms->out.flush().then([strms] {
-                            return strms->in.read_exactly(message.size()).then([](temporary_buffer<char> buf) {
+                return do_for_each(range, [strms, msg](auto) {
+                    return strms->out.write(*msg).then([strms, msg]() {
+                        return strms->out.flush().then([strms, msg] {
+                            return strms->in.read_exactly(msg->size()).then([msg](temporary_buffer<char> buf) {
                                 sstring tmp(buf.begin(), buf.end());
-                                BOOST_CHECK(message == tmp);
+                                BOOST_CHECK(*msg == tmp);
                             });
                         });
                     });
@@ -190,17 +270,17 @@ SEASTAR_TEST_CASE(test_simple_x509_client_server) {
     // will not validate
     // Must match expected name with cert CA or give empty name to ignore
     // server name
-    return run_echo_test(20, "tests/catest.pem", "test.scylladb.org");
+    return run_echo_test(message, 20, "tests/catest.pem", "test.scylladb.org");
 }
 
 
 SEASTAR_TEST_CASE(test_simple_x509_client_server_again) {
-    return run_echo_test(20, "tests/catest.pem", "test.scylladb.org");
+    return run_echo_test(message, 20, "tests/catest.pem", "test.scylladb.org");
 }
 
 SEASTAR_TEST_CASE(test_x509_client_server_cert_validation_fail) {
     // Load a real trust authority here, which out certs are _not_ signed with.
-    return run_echo_test(1, "tests/tls-ca-bundle.pem", {}).then([] {
+    return run_echo_test(message, 1, "tests/tls-ca-bundle.pem", {}).then([] {
             BOOST_FAIL("Should have gotten validation error");
     }).handle_exception([](auto ep) {
         try {
@@ -215,7 +295,7 @@ SEASTAR_TEST_CASE(test_x509_client_server_cert_validation_fail) {
 
 SEASTAR_TEST_CASE(test_x509_client_server_cert_validation_fail_name) {
     // Use trust store with our signer, but wrong host name
-    return run_echo_test(1, "tests/tls-ca-bundle.pem", "nils.holgersson.gov").then([] {
+    return run_echo_test(message, 1, "tests/tls-ca-bundle.pem", "nils.holgersson.gov").then([] {
             BOOST_FAIL("Should have gotten validation error");
     }).handle_exception([](auto ep) {
         try {
@@ -226,4 +306,38 @@ SEASTAR_TEST_CASE(test_x509_client_server_cert_validation_fail_name) {
             BOOST_FAIL("Unexpected exception");
         }
     });
+}
+
+SEASTAR_TEST_CASE(test_large_message_x509_client_server) {
+    // Make sure we load our own auth trust pem file, otherwise our certs
+    // will not validate
+    // Must match expected name with cert CA or give empty name to ignore
+    // server name
+    sstring msg(sstring::initialized_later(), 512 * 1024);
+    for (size_t i = 0; i < msg.size(); ++i) {
+        msg[i] = '0' + char(i % 30);
+    }
+    return run_echo_test(std::move(msg), 20, "tests/catest.pem", "test.scylladb.org");
+}
+
+SEASTAR_TEST_CASE(test_simple_x509_client_server_fail_client_auth) {
+    // Make sure we load our own auth trust pem file, otherwise our certs
+    // will not validate
+    // Must match expected name with cert CA or give empty name to ignore
+    // server name
+    // Server will require certificate auth. We supply none, so should fail connection
+    return run_echo_test(message, 20, "tests/catest.pem", "test.scylladb.org", "tests/test.crt", "tests/test.key", tls::client_auth::REQUIRE).then([] {
+        BOOST_FAIL("Expected exception");
+    }).handle_exception([](auto ep) {
+        // ok.
+    });
+}
+
+SEASTAR_TEST_CASE(test_simple_x509_client_server_client_auth) {
+    // Make sure we load our own auth trust pem file, otherwise our certs
+    // will not validate
+    // Must match expected name with cert CA or give empty name to ignore
+    // server name
+    // Server will require certificate auth. We supply one, so should succeed with connection
+    return run_echo_test(message, 20, "tests/catest.pem", "test.scylladb.org", "tests/test.crt", "tests/test.key", tls::client_auth::REQUIRE, "tests/test.crt", "tests/test.key");
 }

@@ -38,6 +38,10 @@
 #include "net/byteorder.hh"
 #include "core/shared_ptr.hh"
 #include "core/sstring.hh"
+#include "core/print.hh"
+#include "util/log.hh"
+
+#include "core/metrics_api.hh"
 
 /**
  * Implementation of rudimentary collectd data gathering.
@@ -79,12 +83,193 @@
 
 namespace scollectd {
 
-// The value binding data types
-enum class data_type : uint8_t {
-    COUNTER, // unsigned int 64
-    GAUGE, // double
-    DERIVE, // signed int 64
-    ABSOLUTE, // unsigned int 64
+extern seastar::logger logger;
+
+using data_type = seastar::metrics::impl::data_type;
+
+enum class known_type {
+    // from types.db. Defined collectd types (type_id) selection.
+    // This enum omits the very application specific types, such
+    // as mysql_* etc, since if you really are re-writing mysql
+    // in seastar, you probably know how to look the type up manually...
+
+    absolute,
+    backends,
+    bitrate,
+    blocked_clients,
+    bytes,
+    cache_eviction,
+    cache_operation,
+    cache_ratio,
+    cache_result,
+    cache_size,
+    capacity,
+    changes_since_last_save,
+    charge,
+    clock_last_meas,
+    clock_last_update,
+    clock_mode,
+    clock_reachability,
+    clock_skew_ppm,
+    clock_state,
+    clock_stratum,
+    compression,
+    compression_ratio,
+    connections,
+    conntrack,
+    contextswitch,
+    count,
+    counter,
+    cpu,
+    cpufreq,
+    current,
+    current_connections,
+    current_sessions,
+    delay,
+    derive,
+    df,
+    df_complex,
+    df_inodes,
+    disk_io_time,
+    disk_latency,
+    disk_merged,
+    disk_octets,
+    disk_ops,
+    disk_ops_complex,
+    disk_time,
+    dns_answer,
+    dns_notify,
+    dns_octets,
+    dns_opcode,
+    dns_qtype,
+    dns_qtype_cached,
+    dns_query,
+    dns_question,
+    dns_rcode,
+    dns_reject,
+    dns_request,
+    dns_resolver,
+    dns_response,
+    dns_transfer,
+    dns_update,
+    dns_zops,
+    drbd_resource,
+    duration,
+    email_check,
+    email_count,
+    email_size,
+    entropy,
+    evicted_keys,
+    expired_keys,
+    fanspeed,
+    file_handles,
+    file_size,
+    files,
+    flow,
+    fork_rate,
+    frequency,
+    frequency_error,
+    frequency_offset,
+    fscache_stat,
+    gauge,
+    hash_collisions,
+    http_request_methods,
+    http_requests,
+    http_response_codes,
+    humidity,
+    if_collisions,
+    if_dropped,
+    if_errors,
+    if_multicast,
+    if_octets,
+    if_packets,
+    if_rx_errors,
+    if_rx_octets,
+    if_tx_errors,
+    if_tx_octets,
+    invocations,
+    io_octets,
+    io_packets,
+    ipt_bytes,
+    ipt_packets,
+    irq,
+    latency,
+    links,
+    load,
+    md_disks,
+    memory,
+    memory_lua,
+    memory_throttle_count,
+    multimeter,
+    mutex_operations,
+    objects,
+    operations,
+    packets,
+    pending_operations,
+    percent,
+    percent_bytes,
+    percent_inodes,
+    ping,
+    ping_droprate,
+    ping_stddev,
+    players,
+    power,
+    pressure,
+    protocol_counter,
+    pubsub,
+    queue_length,
+    records,
+    requests,
+    response_code,
+    response_time,
+    root_delay,
+    root_dispersion,
+    route_etx,
+    route_metric,
+    routes,
+    segments,
+    serial_octets,
+    signal_noise,
+    signal_power,
+    signal_quality,
+    snr,
+    spl,
+    swap,
+    swap_io,
+    tcp_connections,
+    temperature,
+    threads,
+    time_dispersion,
+    time_offset,
+    time_offset_ntp,
+    time_offset_rms,
+    time_ref,
+    timeleft,
+    total_bytes,
+    total_connections,
+    total_objects,
+    total_operations,
+    total_requests,
+    total_sessions,
+    total_threads,
+    total_time_in_ms,
+    total_values,
+    uptime,
+    users,
+    vcl,
+    vcpu,
+    virt_cpu_total,
+    virt_vcpu,
+    vmpage_action,
+    vmpage_faults,
+    vmpage_io,
+    vmpage_number,
+    volatile_changes,
+    voltage,
+    voltage_threshold,
+    vs_memory,
+    vs_processes,
+    vs_threads,
 };
 
 // don't use directly. use make_typed.
@@ -102,17 +287,45 @@ static inline typed<T> make_typed(data_type type, T&& t) {
     return typed<T>(type, std::forward<T>(t));
 }
 
-typedef sstring plugin_id;
-typedef sstring plugin_instance_id;
-typedef sstring type_id;
-typedef sstring type_instance;
+using plugin_id = seastar::metrics::group_name_type;
+using plugin_instance_id = seastar::metrics::instance_id_type;
+using type_id = seastar::metrics::metric_type_def;
+using type_instance = seastar::metrics::metric_name_type;
+
+type_id type_id_for(known_type);
+
+using description = seastar::metrics::description;
+
+static constexpr unsigned max_collectd_field_text_len = 63;
 
 class type_instance_id {
+    static thread_local unsigned _next_truncated_idx;
+
+    /// truncate a given field to the maximum allowed length
+    void truncate(sstring& field, const char* field_desc) {
+        if (field.size() > max_collectd_field_text_len) {
+            auto suffix_len = std::ceil(std::log10(++_next_truncated_idx)) + 1;
+            sstring new_field(seastar::format("{}~{:d}", sstring(field.data(), max_collectd_field_text_len - suffix_len), _next_truncated_idx));
+
+            logger.warn("Truncating \"{}\" to {} chars: \"{}\" -> \"{}\"", field_desc, max_collectd_field_text_len, field, new_field);
+            field = std::move(new_field);
+        }
+    }
 public:
     type_instance_id() = default;
-    type_instance_id(const plugin_id & p, const plugin_instance_id & pi,
-            const type_id & t, const scollectd::type_instance & ti = std::string())
-    : _plugin(p), _plugin_instance(pi), _type(t), _type_instance(ti) {
+    type_instance_id(plugin_id p, plugin_instance_id pi, type_id t,
+                    scollectd::type_instance ti = std::string())
+                    : _plugin(std::move(p)), _plugin_instance(std::move(pi)), _type(
+                                    std::move(t)), _type_instance(std::move(ti)) {
+        // truncate strings to the maximum allowed length
+        truncate(_plugin, "plugin");
+        truncate(_plugin_instance, "plugin_instance");
+        truncate(_type, "type");
+        truncate(_type_instance, "type_instance");
+    }
+    type_instance_id(const seastar::metrics::impl::metric_id &id) : _plugin(id.group_name()),
+            _plugin_instance(id.instance_id()), _type(id.inherit_type()),
+            _type_instance(id.name()) {
     }
     type_instance_id(type_instance_id &&) = default;
     type_instance_id(const type_instance_id &) = default;
@@ -147,6 +360,8 @@ void configure(const boost::program_options::variables_map&);
 boost::program_options::options_description get_options_description();
 void remove_polled_metric(const type_instance_id &);
 
+class plugin_instance_metrics;
+
 /**
  * Anchor for polled registration.
  * Iff the registered type is in some way none-persistent,
@@ -161,17 +376,11 @@ void remove_polled_metric(const type_instance_id &);
  */
 struct registration {
     registration() = default;
-    registration(const type_instance_id& id)
-    : _id(id) {
-    }
-    registration(type_instance_id&& id)
-    : _id(std::move(id)) {
-    }
+    registration(const type_instance_id& id);
+    registration(type_instance_id&& id);
     registration(const registration&) = delete;
     registration(registration&&) = default;
-    ~registration() {
-        unregister();
-    }
+    ~registration();
     registration & operator=(const registration&) = delete;
     registration & operator=(registration&&) = default;
 
@@ -180,7 +389,9 @@ struct registration {
         _id = type_instance_id();
     }
 private:
+    friend class plugin_instance_metrics;
     type_instance_id _id;
+    shared_ptr<seastar::metrics::impl::impl> _impl;
 };
 
 /**
@@ -210,6 +421,104 @@ public:
         return registrations::operator=(registrations(l));
     }
 };
+
+class value_list;
+
+struct typed_value {
+    /**
+     * Wraps N values of a given type (type_id).
+     * Used to group types into a plugin_instance_metrics
+     */
+    template<typename... Args>
+    typed_value(const type_id& tid, const scollectd::type_instance& ti, description, Args&&... args);
+
+    template<typename... Args>
+    typed_value(const type_id& tid, const scollectd::type_instance& ti, Args&&... args)
+        : typed_value(tid, ti, description(), std::forward<Args>(args)...)
+    {}
+
+    const scollectd::type_instance& type_instance() const {
+        return _type_instance;
+    }
+    const shared_ptr<value_list>& values() const {
+        return _values;
+    }
+    const type_id & type() const {
+        return _type_id;
+    }
+private:
+    type_id _type_id;
+    scollectd::type_instance _type_instance;
+    ::shared_ptr<value_list> _values;
+};
+
+class plugin_instance_metrics {
+public:
+    template<typename... TypedValues>
+    plugin_instance_metrics(const plugin_id& p, const plugin_instance_id& pi, TypedValues&&... values)
+        : _plugin_id(p)
+        , _plugin_instance(pi)
+        , _registrations({ add_impl(values)... })
+    {}
+    std::vector<type_instance_id> bound_ids() const;
+    void add(const typed_value&);
+private:
+    type_instance_id add_impl(const typed_value&);
+
+    plugin_id _plugin_id;
+    plugin_instance_id _plugin_instance;
+    registrations _registrations;
+};
+
+/**
+ * Simplified wrapper for the common case of per-cpu plugin instances
+ * (i.e. distributed objects)
+ */
+class percpu_plugin_instance_metrics : public plugin_instance_metrics {
+public:
+    template<typename... TypedValues>
+    percpu_plugin_instance_metrics(const plugin_id& p, TypedValues&&... values)
+        : plugin_instance_metrics(p, per_cpu_plugin_instance, std::forward<TypedValues>(values)...)
+    {}
+};
+
+/**
+ * Template wrapper for type_id values, deriving type_id string
+ * from the known_types enum, for auto-completetion joy.
+ */
+template<known_type Type>
+struct typed_value_impl: public typed_value {
+    template<typename ... Args>
+    typed_value_impl(const scollectd::type_instance& ti, Args&& ... args)
+        : typed_value(type_id_for(Type), ti, std::forward<Args>(args)...)
+    {}
+
+    template<typename ... Args>
+    typed_value_impl(scollectd::type_instance ti, description d, Args&& ... args)
+        : typed_value(type_id_for(Type), std::move(ti), std::move(d), std::forward<Args>(args)...)
+    {}
+    template<typename ... Args>
+    typed_value_impl(description d, Args&& ... args)
+        : typed_value(type_id_for(Type), scollectd::type_instance(), std::move(d), std::forward<Args>(args)...)
+    {}
+};
+
+/**
+ * Some typedefs for common used types. Feel free to add.
+ */
+typedef typed_value_impl<known_type::total_bytes> total_bytes;
+typedef typed_value_impl<known_type::total_connections> total_connections;
+typedef typed_value_impl<known_type::total_objects> total_objects;
+typedef typed_value_impl<known_type::total_operations> total_operations;
+typedef typed_value_impl<known_type::total_requests> total_requests;
+typedef typed_value_impl<known_type::total_sessions> total_sessions;
+typedef typed_value_impl<known_type::total_threads> total_threads;
+typedef typed_value_impl<known_type::total_time_in_ms> total_time_in_ms;
+typedef typed_value_impl<known_type::total_values> total_values;
+typedef typed_value_impl<known_type::queue_length> queue_length;
+typedef typed_value_impl<known_type::counter> counter;
+typedef typed_value_impl<known_type::count> count;
+typedef typed_value_impl<known_type::gauge> gauge;
 
 // lots of template junk to build typed value list tuples
 // for registered values.
@@ -350,16 +659,35 @@ public:
 };
 
 class value_list {
+    bool _enabled = true;
 public:
+    value_list(description d) : _description(std::move(d))
+    {}
+    value_list(value_list&&) = default;
     virtual ~value_list() {}
+
     virtual size_t size() const = 0;
 
     virtual void types(data_type *) const = 0;
     virtual void values(net::packed<uint64_t> *) const = 0;
 
+    const description& desc() const {
+        return _description;
+    }
+
     bool empty() const {
         return size() == 0;
     }
+
+    bool is_enabled() const {
+        return _enabled;
+    }
+
+    void set_enabled(bool b) {
+        _enabled = b;
+    }
+private:
+    description _description;
 };
 
 template<typename ... Args>
@@ -367,8 +695,9 @@ class values_impl: public value_list {
 public:
     static const size_t num_values = sizeof...(Args);
 
-    values_impl(Args&& ...args)
-    : _values(std::forward<Args>(args)...)
+    values_impl(description d, Args&& ...args)
+        : value_list(std::move(d))
+        , _values(std::forward<Args>(args)...)
     {}
 
     values_impl(values_impl<Args...>&& a) = default;
@@ -403,21 +732,28 @@ private:
     std::tuple < Args... > _values;
 };
 
-void add_polled(const type_instance_id &, const shared_ptr<value_list> &);
+void add_polled(const type_instance_id &, const shared_ptr<value_list> &, bool enabled = true);
 
 typedef std::function<void()> notify_function;
 template<typename... _Args>
-static auto make_type_instance(_Args && ... args) -> values_impl < decltype(value<_Args>(std::forward<_Args>(args)))... >
+static auto make_type_instance(description d, _Args && ... args) -> values_impl < decltype(value<_Args>(std::forward<_Args>(args)))... >
 {
-    return values_impl<decltype(value<_Args>(std::forward<_Args>(args)))... >
-    (value<_Args>(std::forward<_Args>(args))...);
+    return values_impl<decltype(value<_Args>(std::forward<_Args>(args)))...>(
+                    std::move(d), value<_Args>(std::forward<_Args>(args))...);
 }
 template<typename ... _Args>
 static type_instance_id add_polled_metric(const plugin_id & plugin,
         const plugin_instance_id & plugin_instance, const type_id & type,
         const scollectd::type_instance & type_instance, _Args&& ... args) {
+    return add_polled_metric(plugin, plugin_instance, type, type_instance, description(),
+            std::forward<_Args>(args)...);
+}
+template<typename ... _Args>
+static type_instance_id add_polled_metric(const plugin_id & plugin,
+        const plugin_instance_id & plugin_instance, const type_id & type,
+        const scollectd::type_instance & type_instance, description d, _Args&& ... args) {
     return add_polled_metric(
-            type_instance_id(plugin, plugin_instance, type, type_instance),
+            type_instance_id(plugin, plugin_instance, type, type_instance), std::move(d),
             std::forward<_Args>(args)...);
 }
 template<typename ... _Args>
@@ -436,15 +772,38 @@ static notify_function create_explicit_metric(const plugin_id & plugin,
             type_instance_id(plugin, plugin_instance, type, type_instance),
             std::forward<_Args>(args)...);
 }
-template<typename ... _Args>
-static type_instance_id add_polled_metric(const type_instance_id & id,
-        _Args&& ... args) {
-    typedef decltype(make_type_instance(std::forward<_Args>(args)...)) impl_type;
-    add_polled(id,
-            ::make_shared<impl_type>(
-                    make_type_instance(std::forward<_Args>(args)...)));
+
+seastar::metrics::impl::metric_id to_metrics_id(const type_instance_id & id);
+
+template<typename Arg>
+static type_instance_id add_polled_metric(const type_instance_id & id, description d,
+        Arg&& arg, bool enabled = true) {
+    namespace sm = seastar::metrics::impl;
+    shared_ptr<sm::registered_metric> rm =
+                ::make_shared<sm::registered_metric>(arg.type, sm::make_function(arg.value, arg.type), d, enabled);
+    seastar::metrics::impl::get_local_impl()->add_registration(to_metrics_id(id), rm);
     return id;
 }
+
+template<typename Arg>
+static type_instance_id add_polled_metric(const type_instance_id & id,
+        Arg&& arg) {
+    return std::move(add_polled_metric(id, description(), std::forward<Arg>(arg)));
+}
+
+
+template<typename Args>
+static type_instance_id add_disabled_polled_metric(const type_instance_id & id, description d,
+        Args&& arg) {
+    return add_polled_metric(id, d, std::forward<Args>(arg), false);
+}
+
+template<typename Args>
+static type_instance_id add_disabled_polled_metric(const type_instance_id & id,
+        Args&& args) {
+    return add_disabled_polled_metric(id, description(), std::forward<Args>(args));
+}
+
 // "Explicit" metric sends. Sends a single value list as a message.
 // Obviously not super efficient either. But maybe someone needs it sometime.
 template<typename ... _Args>
@@ -460,6 +819,13 @@ static notify_function create_explicit_metric(const type_instance_id & id,
         send_metric(id, list);
     };
 }
+
+template<typename... Args>
+typed_value::typed_value(const type_id& tid, const scollectd::type_instance& ti, description d, Args&&... args)
+    : _type_id(tid)
+    , _type_instance(ti)
+    , _values(::make_shared<decltype(make_type_instance(std::move(d), std::forward<Args>(args)...))>(make_type_instance(std::move(d), std::forward<Args>(args)...)))
+{}
 
 // Send a message packet (string)
 future<> send_notification(const type_instance_id & id, const sstring & msg);

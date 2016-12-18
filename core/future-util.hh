@@ -29,6 +29,8 @@
 #include "future.hh"
 #include "shared_ptr.hh"
 #include "do_with.hh"
+#include "timer.hh"
+#include "util/bool_class.hh"
 #include <tuple>
 #include <iterator>
 #include <vector>
@@ -172,7 +174,8 @@ void do_until_continued(StopCondition&& stop_cond, AsyncAction&& action, promise
 }
 /// \endcond
 
-enum class stop_iteration { no, yes };
+struct stop_iteration_tag { };
+using stop_iteration = bool_class<stop_iteration_tag>;
 
 /// Invokes given action until it fails or the function requests iteration to stop by returning
 /// \c stop_iteration::yes.
@@ -206,7 +209,7 @@ future<> repeat(AsyncAction&& action) {
             if (f.get0() == stop_iteration::yes) {
                 return make_ready_future<>();
             }
-        } while (++future_avail_count % max_inlined_continuations);
+        } while (!need_preempt());
 
         promise<> p;
         auto f = p.get_future();
@@ -283,7 +286,7 @@ repeat_until_value(AsyncAction&& action) {
         if (optional) {
             return make_ready_future<value_type>(std::move(optional.value()));
         }
-    } while (++future_avail_count % max_inlined_continuations);
+    } while (!need_preempt());
 
     try {
         promise<value_type> p;
@@ -553,8 +556,13 @@ map_reduce(Iterator begin, Iterator end, Mapper&& mapper, Reducer&& r)
     using futurator = futurize<decltype(mapper(*begin))>;
     while (begin != end) {
         ret = futurator::apply(mapper, *begin++).then_wrapped([ret = std::move(ret), r_ptr] (auto f) mutable {
-            return ret.then([f = std::move(f), r_ptr] () mutable {
-                return (*r_ptr)(std::move(f.get0()));
+            return ret.then_wrapped([f = std::move(f), r_ptr] (auto rf) mutable {
+                if (rf.failed()) {
+                    f.ignore_ready_future();
+                    return std::move(rf);
+                } else {
+                    return futurize<void>::apply(*r_ptr, std::move(f.get()));
+                }
             });
         });
     }
@@ -691,6 +699,52 @@ future<> now() {
 
 // Returns a future which is not ready but is scheduled to resolve soon.
 future<> later();
+
+class timed_out_error : public std::exception {
+public:
+    virtual const char* what() const noexcept {
+        return "timedout";
+    }
+};
+
+struct default_timeout_exception_factory {
+    static auto timeout() {
+        return timed_out_error();
+    }
+};
+
+/// \brief Wait for either a future, or a timeout, whichever comes first
+///
+/// When timeout is reached the returned future resolves with an exception
+/// produced by ExceptionFactory::timeout(). By default it is \ref timed_out_error exception.
+///
+/// Note that timing out doesn't cancel any tasks associated with the original future.
+/// It also doesn't cancel the callback registerred on it.
+///
+/// \param f future to wait for
+/// \param timeout time point after which the returned future should be failed
+///
+/// \return a future which will be either resolved with f or a timeout exception
+template<typename ExceptionFactory = default_timeout_exception_factory, typename Clock, typename Duration, typename... T>
+future<T...> with_timeout(std::chrono::time_point<Clock, Duration> timeout, future<T...> f) {
+    if (f.available()) {
+        return f;
+    }
+    auto pr = std::make_unique<promise<T...>>();
+    auto result = pr->get_future();
+    timer<Clock> timer([&pr = *pr] {
+        pr.set_exception(std::make_exception_ptr(ExceptionFactory::timeout()));
+    });
+    timer.arm(timeout);
+    f.then_wrapped([pr = std::move(pr), timer = std::move(timer)] (auto&& f) mutable {
+        if (timer.cancel()) {
+            f.forward_to(std::move(*pr));
+        } else {
+            f.ignore_ready_future();
+        }
+    });
+    return result;
+}
 
 /// @}
 
